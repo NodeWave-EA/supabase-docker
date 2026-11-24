@@ -202,3 +202,18 @@ sh run.sh start
 2. Push this repository to `main`.
 3. Open **Actions → Backfill Historical Supabase Versions**, click **Run workflow**, and enter how many recent releases
    to import (e.g., `5`).
+
+## Bootstrapping Two Instances on One Server
+
+```bash
+# ./nodewave/bootstrap.sh --help
+
+# Instance 1: Project Alpha -> gateway on 127.0.0.1:8001, Postgres on 5433
+git clone --branch v0.8.4 https://github.com/Nodewave-EA/supabase-docker.git /srv/project-alpha
+(cd /srv/project-alpha && ./nodewave/bootstrap.sh -d alpha.nodewave.net -p supabase-alpha -o 1 -y && sh run.sh start)
+
+# Instance 2: Project Beta -> gateway on 127.0.0.1:8002, Postgres on 5434
+git clone --branch v0.8.4 https://github.com/Nodewave-EA/supabase-docker.git /srv/project-beta
+(cd /srv/project-beta && ./nodewave/bootstrap.sh -d beta.nodewave.net -p supabase-beta -o 2 -y && sh run.sh start)
+
+```
