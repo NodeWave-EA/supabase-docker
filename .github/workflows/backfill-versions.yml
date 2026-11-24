@@ -26,8 +26,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COUNT: ${{ github.event.inputs.count }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          {
+            printf '%s\n' \
+              '.git' \
+              '.github' \
+              '.upstream-version' \
+              '.supabase-version' \
+              '.nodewave-upgrade-state' \
+              '.env' \
+              '.env.development' \
+              '.env.production' \
+              '.env.staging' \
+              '.env.local' \
+              '.env.clients' \
+              '.env.clients.*' \
+              'backups/'
+
+            if [ -f .nodewave-overlays ]; then
+              grep -Ev '^[[:space:]]*(#|$)' .nodewave-overlays | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            fi
+          } > /tmp/rsync-excludes.txt
 
           # Fetch the last N tags sorted newest-first, then reverse to oldest-first
           TAGS=$(git ls-remote --tags --refs --sort=-v:refname \
@@ -53,15 +75,7 @@ jobs:
             git -C /tmp/supabase-upstream sparse-checkout set docker
 
             rsync -av --delete \
-              --exclude='.git' \
-              --exclude='.github' \
-              --exclude='.upstream-version' \
-              --exclude='.env' \
-              --exclude='.env.nodewave.example' \
-              --exclude='docker-compose.nodewave.yml' \
-              --exclude='docker-compose.caddy.nodewave.yml' \
-              --exclude='nodewave' \
-              --exclude='README.md' \
+              --exclude-from=/tmp/rsync-excludes.txt \
               /tmp/supabase-upstream/docker/ ./
 
             printf "%s\n" "$UPSTREAM_TAG" > .upstream-version

@@ -25,6 +25,7 @@ jobs:
       - name: Resolve target upstream tag
         id: resolve
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.tag }}" ]; then
             TARGET_TAG="${{ github.event.inputs.tag }}"
           else
@@ -51,6 +52,7 @@ jobs:
       - name: Sparse-clone upstream docker directory
         if: steps.resolve.outputs.up_to_date == 'false'
         run: |
+          set -euo pipefail
           TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
           git clone --depth 1 --filter=blob:none --sparse \
             --branch "$TARGET_TAG" \
@@ -60,17 +62,32 @@ jobs:
       - name: Sync upstream files to repository root
         if: steps.resolve.outputs.up_to_date == 'false'
         run: |
+          set -euo pipefail
           TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+
+          {
+            printf '%s\n' \
+              '.git' \
+              '.github' \
+              '.upstream-version' \
+              '.supabase-version' \
+              '.nodewave-upgrade-state' \
+              '.env' \
+              '.env.development' \
+              '.env.production' \
+              '.env.staging' \
+              '.env.local' \
+              '.env.clients' \
+              '.env.clients.*' \
+              'backups/'
+
+            if [ -f .nodewave-overlays ]; then
+              grep -Ev '^[[:space:]]*(#|$)' .nodewave-overlays | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            fi
+          } > /tmp/rsync-excludes.txt
+
           rsync -av --delete \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.upstream-version' \
-            --exclude='.env' \
-            --exclude='.env.nodewave.example' \
-            --exclude='docker-compose.nodewave.yml' \
-            --exclude='docker-compose.caddy.nodewave.yml' \
-            --exclude='nodewave' \
-            --exclude='README.md' \
+            --exclude-from=/tmp/rsync-excludes.txt \
             /tmp/supabase-upstream/docker/ ./
 
           printf "%s\n" "$TARGET_TAG" > .upstream-version

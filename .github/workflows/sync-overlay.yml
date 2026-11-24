@@ -5,9 +5,11 @@ on:
     branches:
       - main
     paths:
+      - ".nodewave-overlays"
       - "nodewave/**"
-      - "docker-compose.nodewave.yml"
-      - ".env.nodewave.example"
+      - "*nodewave*"
+      - "**/*nodewave*"
+      - "README.md"
   workflow_dispatch:
     inputs:
       branch:
@@ -34,6 +36,7 @@ jobs:
       - name: Resolve target release branches
         id: find
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.branch }}" ]; then
             TARGET="${{ github.event.inputs.branch }}"
             if git show-ref --verify --quiet "refs/remotes/origin/${TARGET}"; then
@@ -71,11 +74,41 @@ jobs:
           ref: ${{ matrix.branch }}
           fetch-depth: 0
 
-      - name: Copy Nodewave overlay files from main
+      - name: Sync Nodewave overlay paths from main manifest
+        id: sync
         run: |
-          rm -rf nodewave
-          git checkout origin/main -- nodewave docker-compose.nodewave.yml .env.nodewave.example
-          git reset HEAD -- nodewave docker-compose.nodewave.yml .env.nodewave.example
+          set -euo pipefail
+
+          MANIFEST=$(git show origin/main:.nodewave-overlays \
+            | grep -Ev '^[[:space:]]*(#|$)' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+          while IFS= read -r pattern; do
+            [ -n "$pattern" ] || continue
+
+            if [[ "$pattern" == */ ]]; then
+              dir="${pattern%/}"
+              rm -rf "$dir"
+              if git cat-file -e "origin/main:${dir}" 2>/dev/null; then
+                git checkout origin/main -- "$dir"
+              fi
+            elif [[ "$pattern" == *'*'* || "$pattern" == *'?'* || "$pattern" == *'['* ]]; then
+              while IFS= read -r existing; do
+                [ -n "$existing" ] && rm -f "$existing"
+              done < <(git ls-files "$pattern")
+
+              while IFS= read -r matched; do
+                [ -n "$matched" ] && git checkout origin/main -- "$matched"
+              done < <(git ls-tree -r --name-only origin/main -- "$pattern")
+            else
+              rm -f "$pattern"
+              if git cat-file -e "origin/main:${pattern}" 2>/dev/null; then
+                git checkout origin/main -- "$pattern"
+              fi
+            fi
+          done <<< "$MANIFEST"
+
+          git reset HEAD
 
       - name: Open or update Pull Request
         uses: peter-evans/create-pull-request@v7
@@ -86,11 +119,6 @@ jobs:
           commit-message: "chore(nodewave): sync overlay updates to ${{ matrix.branch }}"
           title: "chore(nodewave): sync overlay updates to ${{ matrix.branch }}"
           body: |
-            Automated backport of Nodewave overlay changes from `main` (`${{ github.sha }}`) into **`${{ matrix.branch }}`**.
-
-            ### Synced Paths
-            - `nodewave/`
-            - `docker-compose.nodewave.yml`
-            - `.env.nodewave.example`
+            Automated backport of Nodewave overlay changes from `main` (`${{ github.sha }}`) into **`${{ matrix.branch }}`** using `.nodewave-overlays` as the source of truth.
 
             > Upstream Supabase files (`docker-compose.yml`, `volumes/`, `.upstream-version`) are untouched.
