@@ -261,7 +261,7 @@ ensure_local_excludes() {
   git_dir=$(git -C "$SUPABASE_ROOT" rev-parse --git-dir)
   [[ "$git_dir" = /* ]] || git_dir="${SUPABASE_ROOT}/${git_dir}"
   mkdir -p "${git_dir}/info"
-  for pattern in ".nodewave-upgrade-state" "docker-compose.instance.yml" ".env.clients" ".env.development" ".env.production" "backups/"; do
+  for pattern in ".nodewave-upgrade-state" "docker-compose.instance.yml" ".env.clients" ".env.clients.*" ".env.development" ".env.production" "backups/"; do
     if ! grep -qxF "$pattern" "${git_dir}/info/exclude" 2>/dev/null; then
       echo "$pattern" >>"${git_dir}/info/exclude"
     fi
@@ -283,15 +283,17 @@ resolve_compose_context() {
   local chosen_files="$COMPOSE_FILES_ARG"
 
   if [ -z "$chosen_files" ] && [ "$IS_SUBMODULE" = true ]; then
-    # Discover compose files in parent repo
+    # Discover compose files in parent repo (docker-compose.yml first when managed as symlink)
     local candidates=()
-    for f in docker-compose.prod.yml docker-compose.dev.yml docker-compose.yml compose.prod.yml compose.dev.yml compose.yml; do
+    for f in docker-compose.yml docker-compose.prod.yml docker-compose.dev.yml compose.yml compose.prod.yml compose.dev.yml; do
       [ -f "${PARENT_ROOT}/${f}" ] && candidates+=("$f")
     done
 
-    # Infer default from docker/supabase/.env symlink target if present
+    # Infer default: prefer active docker-compose.yml symlink, otherwise match .env symlink
     local default_idx=1
-    if [ -L "${SUPABASE_ROOT}/.env" ]; then
+    if [ -L "${PARENT_ROOT}/docker-compose.yml" ] && [ -e "${PARENT_ROOT}/docker-compose.yml" ]; then
+      default_idx=1
+    elif [ -L "${SUPABASE_ROOT}/.env" ]; then
       local link_target
       link_target=$(readlink "${SUPABASE_ROOT}/.env")
       for i in "${!candidates[@]}"; do
@@ -342,6 +344,44 @@ run_compose() {
   (cd "$COMPOSE_WORKDIR" && docker compose "${COMPOSE_FLAGS[@]}" "$@")
 }
 
+ensure_parent_env_and_networks() {
+  if [ "$IS_SUBMODULE" = true ] && [ -f "${PARENT_ROOT}/run.sh" ]; then
+    if ! run_compose config --quiet >/dev/null 2>&1; then
+      if grep -q 'switch_env' "${PARENT_ROOT}/run.sh" 2>/dev/null; then
+        local env_flag="--dev"
+        local active_compose=""
+        [ -L "${PARENT_ROOT}/docker-compose.yml" ] && active_compose=$(readlink "${PARENT_ROOT}/docker-compose.yml")
+        for flag in "${COMPOSE_FLAGS[@]}"; do
+          [[ "$flag" == *prod* ]] && env_flag="--prod"
+        done
+        [[ "$active_compose" == *prod* ]] && env_flag="--prod"
+
+        warn "Parent repository environment symlinks are incomplete."
+        if ask_yes_no "Run '${PARENT_ROOT}/run.sh env ${env_flag}' to initialize parent .env symlinks now?" "y"; then
+          (cd "$PARENT_ROOT" && sh ./run.sh env "$env_flag")
+        fi
+      fi
+    fi
+  fi
+
+  # Ensure any external Docker networks declared in the resolved compose config exist
+  if docker info >/dev/null 2>&1; then
+    local ext_nets
+    ext_nets=$(run_compose config 2>/dev/null | awk '
+      /^networks:/ { in_net=1; next }
+      in_net && /^[^[:space:]]/ { in_net=0 }
+      in_net && /^  [a-zA-Z0-9_.-]+:/ { net=$1; sub(/:$/, "", net) }
+      in_net && /external: true/ && net != "" { print net; net="" }
+    ' || true)
+    for net in $ext_nets; do
+      if ! docker network inspect "$net" >/dev/null 2>&1; then
+        docker network create "$net" >/dev/null
+        ok "Created external Docker network: ${net}"
+      fi
+    done
+  fi
+}
+
 # --- Rollback Handler -------------------------------------------------------
 
 perform_rollback() {
@@ -382,6 +422,7 @@ perform_rollback() {
   fi
 
   resolve_compose_context
+  ensure_parent_env_and_networks
   info "Restarting stack with previous version images..."
   run_compose up -d --remove-orphans
 
@@ -516,7 +557,6 @@ else
   if [ -z "$CHANNEL_PREF" ]; then
     if [ "$HAS_RELEASE_BRANCH" = true ] && [ "$HAS_TAG" = true ]; then
       if [ "$NON_INTERACTIVE" = true ] || [ ! -t 0 ]; then
-        # Default to release branch for submodules (matches Nodewave pattern) and tag for standalone
         if [ "$IS_SUBMODULE" = true ]; then
           CHANNEL_PREF="release"
         else
@@ -564,7 +604,14 @@ TARGET_SHORT=$(git -C "$SUPABASE_ROOT" rev-parse --short "$TARGET_COMMIT")
 
 info "Selected Target: ${C_BOLD}${CHECKOUT_REF}${C_RESET} (${TARGET_SHORT})"
 
-if [ "$PREV_COMMIT" = "$TARGET_COMMIT" ]; then
+SUBMODULE_PENDING=false
+if [ "$IS_SUBMODULE" = true ]; then
+  if [ "$PREV_SUBMODULE_BRANCH" != "$TRACK_BRANCH_FOR_SUBMODULE" ] || ! git -C "$PARENT_ROOT" diff --quiet -- "$SUBMODULE_REL"; then
+    SUBMODULE_PENDING=true
+  fi
+fi
+
+if [ "$PREV_COMMIT" = "$TARGET_COMMIT" ] && [ "$SUBMODULE_PENDING" = false ]; then
   ok "Already at ${CHECKOUT_REF} (${TARGET_SHORT})."
   if ! ask_yes_no "Re-run image pull, .env check, and image cleanup anyway?" "n"; then
     exit 0
@@ -579,14 +626,12 @@ step "Snapshotting Active Docker Images Before Upgrade"
 
 OLD_IMAGE_PAIRS=() # "repo:tag|sha256:..."
 if docker info >/dev/null 2>&1; then
-  # 1. Inspect currently running/stopped containers in this compose project
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
     pair=$(docker inspect --format '{{.Config.Image}}|{{.Image}}' "$cid" 2>/dev/null || true)
     [ -n "$pair" ] && OLD_IMAGE_PAIRS+=("$pair")
   done < <(run_compose ps -a -q 2>/dev/null || true)
 
-  # 2. Also inspect images declared in current compose config
   while IFS= read -r img_ref; do
     [ -n "$img_ref" ] || continue
     img_id=$(docker image inspect --format '{{.Id}}' "$img_ref" 2>/dev/null || true)
@@ -594,7 +639,6 @@ if docker info >/dev/null 2>&1; then
   done < <(run_compose config --images 2>/dev/null || true)
 fi
 
-# Deduplicate OLD_IMAGE_PAIRS
 UNIQUE_OLD_PAIRS=()
 if [ "${#OLD_IMAGE_PAIRS[@]}" -gt 0 ]; then
   while IFS= read -r line; do
@@ -764,13 +808,32 @@ if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
       fi
     fi
   done
+
+  # Refresh .env.clients if manage.sh is available
+  if [ -x "${SUPABASE_ROOT}/nodewave/manage.sh" ] && [ -f "${SUPABASE_ROOT}/.env" ]; then
+    "${SUPABASE_ROOT}/nodewave/manage.sh" env --format all >"${SUPABASE_ROOT}/.env.clients"
+    chmod 600 "${SUPABASE_ROOT}/.env.clients" 2>/dev/null || true
+    if [ -L "${SUPABASE_ROOT}/.env" ]; then
+      _active_target=$(basename "$(readlink "${SUPABASE_ROOT}/.env")")
+      if [[ "$_active_target" == .env.* ]]; then
+        cp -a "${SUPABASE_ROOT}/.env.clients" "${SUPABASE_ROOT}/.env.clients.${_active_target#.env.}"
+        chmod 600 "${SUPABASE_ROOT}/.env.clients.${_active_target#.env.}" 2>/dev/null || true
+      fi
+    fi
+    ok "Refreshed .env.clients"
+  fi
 fi
 
 # --- Validate Compose, Pull Images & Restart Stack --------------------------
 
 step "Validating Compose Configuration & Updating Containers"
 
-run_compose config --quiet || die "Docker Compose configuration validation failed. Fix .env or compose overrides before continuing."
+ensure_parent_env_and_networks
+
+if ! COMPOSE_ERR=$(run_compose config --quiet 2>&1); then
+  printf '%s\n' "$COMPOSE_ERR" >&2
+  die "Docker Compose configuration validation failed. Fix the missing .env file or compose reference above and re-run."
+fi
 ok "Compose configuration validated."
 
 if [ "$SKIP_PULL" = false ]; then
@@ -781,7 +844,6 @@ fi
 info "Recreating updated containers..."
 run_compose up -d --remove-orphans
 
-# Wait briefly and verify container health
 sleep 3
 UNHEALTHY=$(run_compose ps --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -E 'Exit|Restarting|unhealthy' || true)
 if [ -n "$UNHEALTHY" ]; then
@@ -804,7 +866,6 @@ cleanup_previous_images() {
   }
   [ "${#UNIQUE_OLD_PAIRS[@]}" -eq 0 ] && return 0
 
-  # Collect every image ID currently in use across the entire Docker host or new compose config
   local IN_USE_IDS=()
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
@@ -829,7 +890,6 @@ cleanup_previous_images() {
     local ref="${pair%%|*}"
     local id="${pair##*|}"
 
-    # Skip if image ID is still in use anywhere on host
     local used=false
     for u_id in "${IN_USE_IDS[@]}"; do
       if [ "$id" = "$u_id" ]; then
@@ -839,7 +899,6 @@ cleanup_previous_images() {
     done
     [ "$used" = true ] && continue
 
-    # Verify image still exists locally
     local sz
     sz=$(docker image inspect --format '{{.Size}}' "$id" 2>/dev/null || true)
     [ -n "$sz" ] || continue
