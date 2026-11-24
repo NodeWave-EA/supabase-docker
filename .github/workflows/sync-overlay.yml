@@ -1,0 +1,59 @@
+name: Sync Nodewave Overlay to Release Branches
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "nodewave/**"
+      - "docker-compose.nodewave.yml"
+      - ".env.nodewave.example"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Specific release/v* branch to update (leave empty for all release/v* branches)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync-overlay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Propagate Nodewave overlay files to release branches
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "${{ github.event.inputs.branch }}" ]; then
+            BRANCHES="origin/${{ github.event.inputs.branch }}"
+          else
+            BRANCHES=$(git branch -r --list 'origin/release/v*' | sed 's/^[[:space:]]*//')
+          fi
+
+          if [ -z "$BRANCHES" ]; then
+            echo "No release/v* branches found."
+            exit 0
+          fi
+
+          for REMOTE_REF in $BRANCHES; do
+            LOCAL_BRANCH="${REMOTE_REF#origin/}"
+            echo "Syncing Nodewave overlay to ${LOCAL_BRANCH}..."
+
+            git checkout -B "$LOCAL_BRANCH" "$REMOTE_REF"
+            git checkout origin/main -- nodewave docker-compose.nodewave.yml .env.nodewave.example
+
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(nodewave): sync overlay updates from main to ${LOCAL_BRANCH}"
+              git push origin "$LOCAL_BRANCH"
+            else
+              echo "${LOCAL_BRANCH} is already up to date."
+            fi
+          done
