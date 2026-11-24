@@ -395,15 +395,43 @@ ensure_external_networks() {
   docker info >/dev/null 2>&1 || return 0
   local ext_nets
   ext_nets=$(run_compose config 2>/dev/null | awk '
-    /^networks:/ { in_net=1; next }
-    in_net && /^[^[:space:]]/ { in_net=0 }
-    in_net && /^  [a-zA-Z0-9_.-]+:/ { net=$1; sub(/:$/, "", net) }
-    in_net && /external: true/ && net != "" { print net; net="" }
+    function flush_net() {
+      if (is_ext && net_key != "") {
+        target = (net_name != "" ? net_name : net_key)
+        if (target != "default" && target != "bridge" && target != "host" && target != "none") {
+          print target
+        }
+      }
+      net_key = ""; net_name = ""; is_ext = 0
+    }
+    /^networks:/ { in_net = 1; next }
+    in_net && /^[^[:space:]]/ { flush_net(); in_net = 0 }
+    in_net && /^  [a-zA-Z0-9_.-]+:/ {
+      flush_net()
+      net_key = $1
+      sub(/:$/, "", net_key)
+      next
+    }
+    in_net && /^    name:/ {
+      net_name = $2
+      gsub(/^["'\'']|["'\'']$/, "", net_name)
+      next
+    }
+    in_net && /^    external:[[:space:]]*true/ {
+      is_ext = 1
+      next
+    }
+    END {
+      if (in_net) flush_net()
+    }
   ' || true)
   for net in $ext_nets; do
     if ! docker network inspect "$net" >/dev/null 2>&1; then
-      docker network create "$net" >/dev/null
-      ok "Created external Docker network: ${net}"
+      if docker network create "$net" >/dev/null 2>&1; then
+        ok "Created external Docker network: ${net}"
+      else
+        warn "Could not auto-create external Docker network '${net}'."
+      fi
     fi
   done
 }
