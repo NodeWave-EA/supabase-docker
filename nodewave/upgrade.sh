@@ -31,7 +31,7 @@ COMPOSE_FILES_ARG="${NODEWAVE_COMPOSE_FILE:-}"
 IMAGE_CLEANUP_MODE="" # all | select | skip | dangling
 SKIP_BACKUP=false
 SKIP_ENV_SYNC=false
-SKIP_PULL=false
+PULL_PREF="" # yes | no | prompt
 SKIP_RESTART=false
 AUTO_COMMIT="" # yes | no | prompt
 AUTO_PUSH=""   # yes | no | prompt
@@ -58,6 +58,7 @@ Options:
       --skip-image-cleanup      Alias for --prune-images skip
       --skip-backup             Skip pre-upgrade database and .env backup
       --skip-env-sync           Skip checking for new keys in .env.example
+      --pull                    Automatically pull container images without prompting
       --skip-pull               Skip 'docker compose pull'
       --skip-restart            Update git checkout & .env files only without starting containers
       --commit                  Automatically commit submodule update in parent repo
@@ -146,8 +147,12 @@ while [ $# -gt 0 ]; do
     SKIP_ENV_SYNC=true
     shift
     ;;
+  --pull)
+    PULL_PREF="yes"
+    shift
+    ;;
   --skip-pull)
-    SKIP_PULL=true
+    PULL_PREF="no"
     shift
     ;;
   --skip-restart)
@@ -262,6 +267,132 @@ format_bytes() {
   }'
 }
 
+image_repo() {
+  local ref="${1%%@*}"
+  local last_part="${ref##*/}"
+  if [[ "$last_part" == *:* ]]; then
+    printf '%s\n' "${ref%:*}"
+  else
+    printf '%s\n' "$ref"
+  fi
+}
+
+image_tag() {
+  local ref="${1%%@*}"
+  local last_part="${ref##*/}"
+  if [[ "$last_part" == *:* ]]; then
+    printf '%s\n' "${last_part#*:}"
+  else
+    printf 'latest\n'
+  fi
+}
+
+# Query compressed download sizes (in bytes) from registry manifests for a list of image refs.
+# Prints lines of: "<image_ref>|<bytes_or_-1>"
+query_remote_image_sizes() {
+  [ $# -eq 0 ] && return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$@" <<'PYEOF'
+import concurrent.futures
+import json
+import os
+import platform
+import subprocess
+import sys
+
+refs = sys.argv[1:]
+machine = platform.machine().lower()
+arch_map = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "armv7l": "arm",
+}
+target_arch = arch_map.get(machine, machine)
+
+env = os.environ.copy()
+env["DOCKER_CLI_EXPERIMENTAL"] = "enabled"
+
+def split_repo(ref: str) -> str:
+    no_digest = ref.split("@", 1)[0]
+    last_slash = no_digest.rfind("/")
+    last_colon = no_digest.rfind(":")
+    if last_colon > last_slash:
+        return no_digest[:last_colon]
+    return no_digest
+
+def fetch_manifest_json(target: str):
+    cmds = [
+        ["docker", "manifest", "inspect", target],
+        ["docker", "buildx", "imagetools", "inspect", "--raw", target],
+    ]
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                timeout=12,
+                text=True,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return json.loads(proc.stdout)
+        except Exception:
+            pass
+    return None
+
+def get_image_size(ref: str) -> int:
+    data = fetch_manifest_json(ref)
+    if not isinstance(data, dict):
+        return -1
+    if "layers" in data:
+        cfg_size = data.get("config", {}).get("size", 0) or 0
+        layers_size = sum((layer.get("size", 0) or 0) for layer in data.get("layers", []))
+        total = int(cfg_size) + int(layers_size)
+        return total if total > 0 else -1
+    if "manifests" in data:
+        chosen_digest = None
+        fallback_digest = None
+        for m in data.get("manifests", []):
+            plat = m.get("platform") or {}
+            p_os = plat.get("os", "")
+            p_arch = plat.get("architecture", "")
+            digest = m.get("digest")
+            if not digest or p_os == "unknown" or p_arch == "unknown":
+                continue
+            if fallback_digest is None:
+                fallback_digest = digest
+            if p_os == "linux" and p_arch == target_arch:
+                chosen_digest = digest
+                break
+        digest = chosen_digest or fallback_digest
+        if not digest:
+            return -1
+        repo = split_repo(ref)
+        sub = fetch_manifest_json(f"{repo}@{digest}")
+        if isinstance(sub, dict) and "layers" in sub:
+            cfg_size = sub.get("config", {}).get("size", 0) or 0
+            layers_size = sum((layer.get("size", 0) or 0) for layer in sub.get("layers", []))
+            total = int(cfg_size) + int(layers_size)
+            return total if total > 0 else -1
+    return -1
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+    results = list(pool.map(get_image_size, refs))
+
+for ref, sz in zip(refs, results):
+    print(f"{ref}|{sz}")
+PYEOF
+  else
+    for ref in "$@"; do
+      printf '%s|-1\n' "$ref"
+    done
+  fi
+}
+
 ensure_local_excludes() {
   local git_dir
   git_dir=$(git -C "$SUPABASE_ROOT" rev-parse --git-dir)
@@ -315,7 +446,6 @@ resolve_compose_context() {
   local chosen_files="$COMPOSE_FILES_ARG"
 
   if [ -z "$chosen_files" ] && [ "$IS_SUBMODULE" = true ]; then
-    # Discover compose files in parent repo (active symlinks/canonical names first)
     local candidates=()
     for f in \
       docker-compose.yml \
@@ -331,7 +461,6 @@ resolve_compose_context() {
       [ -f "${PARENT_ROOT}/${f}" ] && candidates+=("$f")
     done
 
-    # Infer default: prefer active docker-compose.yml/compose.yml symlink, otherwise match .env symlink
     local default_idx=1
     if { [ -L "${PARENT_ROOT}/docker-compose.yml" ] && [ -e "${PARENT_ROOT}/docker-compose.yml" ]; } ||
       { [ -L "${PARENT_ROOT}/compose.yml" ] && [ -e "${PARENT_ROOT}/compose.yml" ]; }; then
@@ -535,7 +664,6 @@ fi
 step "Fetching Available Versions from Origin"
 git -C "$SUPABASE_ROOT" fetch --tags --prune origin
 
-# Gather unique version tags sorted newest first
 AVAILABLE_TAGS=()
 while IFS= read -r tag; do
   [ -n "$tag" ] && AVAILABLE_TAGS+=("$tag")
@@ -584,7 +712,6 @@ if [[ "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   TARGET_VERSION="v${TARGET_VERSION}"
 fi
 
-# Determine git ref to checkout (branch vs immutable tag)
 CHECKOUT_REF=""
 CHECKOUT_KIND="" # branch | tag
 TRACK_BRANCH_FOR_SUBMODULE=""
@@ -685,15 +812,20 @@ fi
 step "Snapshotting Active Docker Images Before Upgrade"
 
 OLD_IMAGE_PAIRS=() # "repo:tag|sha256:..."
+OLD_IMAGE_REFS=()  # "repo:tag"
 if [ "$SKIP_RESTART" = false ] && docker info >/dev/null 2>&1; then
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
     pair=$(docker inspect --format '{{.Config.Image}}|{{.Image}}' "$cid" 2>/dev/null || true)
-    [ -n "$pair" ] && OLD_IMAGE_PAIRS+=("$pair")
+    if [ -n "$pair" ]; then
+      OLD_IMAGE_PAIRS+=("$pair")
+      OLD_IMAGE_REFS+=("${pair%%|*}")
+    fi
   done < <(run_compose ps -a -q 2>/dev/null || true)
 
   while IFS= read -r img_ref; do
     [ -n "$img_ref" ] || continue
+    OLD_IMAGE_REFS+=("$img_ref")
     img_id=$(docker image inspect --format '{{.Id}}' "$img_ref" 2>/dev/null || true)
     [ -n "$img_id" ] && OLD_IMAGE_PAIRS+=("${img_ref}|${img_id}")
   done < <(run_compose config --images 2>/dev/null || true)
@@ -706,7 +838,14 @@ if [ "${#OLD_IMAGE_PAIRS[@]}" -gt 0 ]; then
   done < <(printf '%s\n' "${OLD_IMAGE_PAIRS[@]}" | sort -u)
 fi
 
-info "Captured ${#UNIQUE_OLD_PAIRS[@]} active image reference(s) from current version."
+UNIQUE_OLD_REFS=()
+if [ "${#OLD_IMAGE_REFS[@]}" -gt 0 ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && UNIQUE_OLD_REFS+=("$line")
+  done < <(printf '%s\n' "${OLD_IMAGE_REFS[@]}" | sort -u)
+fi
+
+info "Captured ${#UNIQUE_OLD_REFS[@]} image reference(s) from current version."
 
 # --- Dry Run Summary --------------------------------------------------------
 
@@ -795,7 +934,6 @@ else
   info "No CHANGELOG.md changes between ${PREV_SHORT} and ${TARGET_SHORT}."
 fi
 
-# Guard against accidental PG 15 -> PG 17 mismatch on existing data volume
 if [ "$SKIP_RESTART" = false ] && [ -f "${SUPABASE_ROOT}/volumes/db/data/PG_VERSION" ]; then
   DATA_PG_VER=$(tr -d '[:space:]' <"${SUPABASE_ROOT}/volumes/db/data/PG_VERSION")
   NEW_DB_IMG=$(run_compose config 2>/dev/null | awk '/image:.*supabase\/postgres:/{print $2; exit}' || true)
@@ -848,7 +986,6 @@ if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
       ok "Appended missing keys to $(basename "$env_file")."
     fi
 
-    # Offer asymmetric ES256 auth key generation if newly added and empty
     if grep -q '^SUPABASE_PUBLISHABLE_KEY=$' "$env_file" && [ -f "${SUPABASE_ROOT}/utils/add-new-auth-keys.sh" ]; then
       if ask_yes_no "Generate asymmetric ES256 & opaque API keys for $(basename "$env_file") now?" "y"; then
         (
@@ -883,7 +1020,6 @@ if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
     fi
   done < <(discover_supabase_env_files)
 
-  # Refresh .env.clients if manage.sh is available
   if [ -x "${SUPABASE_ROOT}/nodewave/manage.sh" ] && [ -f "${SUPABASE_ROOT}/.env" ]; then
     "${SUPABASE_ROOT}/nodewave/manage.sh" env --format all >"${SUPABASE_ROOT}/.env.clients"
     chmod 600 "${SUPABASE_ROOT}/.env.clients" 2>/dev/null || true
@@ -898,10 +1034,10 @@ if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
   fi
 fi
 
-# --- Validate Compose, Pull Images & Restart Stack --------------------------
+# --- Validate Compose, Compare Images & Prompt to Pull ----------------------
 
 if [ "$SKIP_RESTART" = false ]; then
-  step "Validating Compose Configuration & Updating Containers"
+  step "Validating Compose Configuration"
 
   while true; do
     if COMPOSE_ERR=$(run_compose config --quiet 2>&1); then
@@ -946,11 +1082,217 @@ fi
 if [ "$SKIP_RESTART" = false ]; then
   ensure_external_networks
 
-  if [ "$SKIP_PULL" = false ]; then
-    info "Pulling container images for ${CHECKOUT_REF}..."
-    run_compose pull
+  step "Comparing Images & Checking Pull Sizes (${PREV_BRANCH:-${PREV_TAG:-$PREV_SHORT}} -> ${CHECKOUT_REF})"
+
+  NEW_IMAGE_REFS=()
+  while IFS= read -r img_ref; do
+    [ -n "$img_ref" ] && NEW_IMAGE_REFS+=("$img_ref")
+  done < <(run_compose config --images 2>/dev/null | sort -u || true)
+
+  # Separate images into:
+  #   - SHARED_REFS: exact same image:tag in previous & target version
+  #   - UPDATED_REFS: changed tag or newly added in target version
+  #   - TO_PULL_REFS: target images not yet cached locally
+  SHARED_REFS=()
+  UPDATED_REFS=()
+  TO_PULL_REFS=()
+  ALREADY_LOCAL_COUNT=0
+
+  for new_ref in "${NEW_IMAGE_REFS[@]}"; do
+    is_shared=false
+    for old_ref in "${UNIQUE_OLD_REFS[@]}"; do
+      if [ "$new_ref" = "$old_ref" ]; then
+        is_shared=true
+        break
+      fi
+    done
+
+    if [ "$is_shared" = true ]; then
+      SHARED_REFS+=("$new_ref")
+    else
+      UPDATED_REFS+=("$new_ref")
+    fi
+
+    if docker image inspect "$new_ref" >/dev/null 2>&1; then
+      ALREADY_LOCAL_COUNT=$((ALREADY_LOCAL_COUNT + 1))
+    else
+      TO_PULL_REFS+=("$new_ref")
+    fi
+  done
+
+  # Fetch compressed manifest sizes in parallel for images not already cached locally
+  REMOTE_SIZE_LINES=()
+  if [ "${#TO_PULL_REFS[@]}" -gt 0 ]; then
+    info "Querying registry manifest sizes for ${#TO_PULL_REFS[@]} uncached image(s)..."
+    while IFS= read -r sz_line; do
+      [ -n "$sz_line" ] && REMOTE_SIZE_LINES+=("$sz_line")
+    done < <(query_remote_image_sizes "${TO_PULL_REFS[@]}")
   fi
 
+  lookup_remote_size() {
+    local target="$1"
+    for entry in "${REMOTE_SIZE_LINES[@]}"; do
+      if [ "${entry%%|*}" = "$target" ]; then
+        printf '%s\n' "${entry##*|}"
+        return 0
+      fi
+    done
+    printf -- '-1\n'
+  }
+
+  TOTAL_PULL_BYTES=0
+  SIZED_PULL_COUNT=0
+  UNSIZED_PULL_COUNT=0
+
+  # 1. Display unchanged/shared images between current and upgraded version
+  if [ "${#SHARED_REFS[@]}" -gt 0 ]; then
+    echo ""
+    info "${C_BOLD}Unchanged / shared images (${#SHARED_REFS[@]}) — same in current & ${CHECKOUT_REF}:${C_RESET}"
+    for s_ref in "${SHARED_REFS[@]}"; do
+      local_sz=$(docker image inspect --format '{{.Size}}' "$s_ref" 2>/dev/null || true)
+      if [ -n "$local_sz" ]; then
+        sz_h=$(format_bytes "$local_sz")
+        printf '      %s[=]%s %-54s %s(cached locally: %s)%s\n' \
+          "$C_DIM" "$C_RESET" "$s_ref" "$C_DIM" "$sz_h" "$C_RESET"
+      else
+        r_sz=$(lookup_remote_size "$s_ref")
+        if [ "$r_sz" -gt 0 ] 2>/dev/null; then
+          TOTAL_PULL_BYTES=$((TOTAL_PULL_BYTES + r_sz))
+          SIZED_PULL_COUNT=$((SIZED_PULL_COUNT + 1))
+          sz_h=$(format_bytes "$r_sz")
+          printf '      %s[=]%s %-54s %s(not local, to pull: ~%s)%s\n' \
+            "$C_YELLOW" "$C_RESET" "$s_ref" "$C_YELLOW" "$sz_h" "$C_RESET"
+        else
+          UNSIZED_PULL_COUNT=$((UNSIZED_PULL_COUNT + 1))
+          printf '      %s[=]%s %-54s %s(not local, to pull: size unknown)%s\n' \
+            "$C_YELLOW" "$C_RESET" "$s_ref" "$C_YELLOW" "$C_RESET"
+        fi
+      fi
+    done
+  fi
+
+  # 2. Display upgraded / newly added images in target version
+  if [ "${#UPDATED_REFS[@]}" -gt 0 ]; then
+    echo ""
+    info "${C_BOLD}Upgraded / new images in ${CHECKOUT_REF} (${#UPDATED_REFS[@]}):${C_RESET}"
+    for u_ref in "${UPDATED_REFS[@]}"; do
+      u_repo=$(image_repo "$u_ref")
+      u_tag=$(image_tag "$u_ref")
+      prev_tag_match=""
+      for old_ref in "${UNIQUE_OLD_REFS[@]}"; do
+        if [ "$(image_repo "$old_ref")" = "$u_repo" ]; then
+          prev_tag_match=$(image_tag "$old_ref")
+          break
+        fi
+      done
+
+      if [ -n "$prev_tag_match" ]; then
+        label="${u_repo}: ${prev_tag_match} -> ${u_tag}"
+        badge="${C_CYAN}[^]${C_RESET}"
+      else
+        label="${u_ref} (new)"
+        badge="${C_GREEN}[+]${C_RESET}"
+      fi
+
+      local_sz=$(docker image inspect --format '{{.Size}}' "$u_ref" 2>/dev/null || true)
+      if [ -n "$local_sz" ]; then
+        sz_h=$(format_bytes "$local_sz")
+        printf '      %s %-54s %s(already local: %s)%s\n' \
+          "$badge" "$label" "$C_GREEN" "$sz_h" "$C_RESET"
+      else
+        r_sz=$(lookup_remote_size "$u_ref")
+        if [ "$r_sz" -gt 0 ] 2>/dev/null; then
+          TOTAL_PULL_BYTES=$((TOTAL_PULL_BYTES + r_sz))
+          SIZED_PULL_COUNT=$((SIZED_PULL_COUNT + 1))
+          sz_h=$(format_bytes "$r_sz")
+          printf '      %s %-54s %s(to pull: ~%s)%s\n' \
+            "$badge" "$label" "$C_YELLOW" "$sz_h" "$C_RESET"
+        else
+          UNSIZED_PULL_COUNT=$((UNSIZED_PULL_COUNT + 1))
+          printf '      %s %-54s %s(to pull: size unknown)%s\n' \
+            "$badge" "$label" "$C_YELLOW" "$C_RESET"
+        fi
+      fi
+    done
+  fi
+
+  # 3. Display images from current version no longer in target version
+  REMOVED_OLD_REFS=()
+  for old_ref in "${UNIQUE_OLD_REFS[@]}"; do
+    still_present=false
+    for new_ref in "${NEW_IMAGE_REFS[@]}"; do
+      if [ "$old_ref" = "$new_ref" ]; then
+        still_present=true
+        break
+      fi
+    done
+    [ "$still_present" = false ] && REMOVED_OLD_REFS+=("$old_ref")
+  done
+
+  if [ "${#REMOVED_OLD_REFS[@]}" -gt 0 ]; then
+    echo ""
+    info "${C_BOLD}Superseded / removed images from current version (${#REMOVED_OLD_REFS[@]}):${C_RESET}"
+    for r_ref in "${REMOVED_OLD_REFS[@]}"; do
+      local_sz=$(docker image inspect --format '{{.Size}}' "$r_ref" 2>/dev/null || true)
+      if [ -n "$local_sz" ]; then
+        sz_h=$(format_bytes "$local_sz")
+        printf '      %s[-]%s %-54s %s(on disk: %s)%s\n' \
+          "$C_RED" "$C_RESET" "$r_ref" "$C_DIM" "$sz_h" "$C_RESET"
+      else
+        printf '      %s[-]%s %-54s\n' "$C_RED" "$C_RESET" "$r_ref"
+      fi
+    done
+  fi
+
+  # Summary of pull requirements & total size
+  echo ""
+  TOTAL_PULL_HUMAN=$(format_bytes "$TOTAL_PULL_BYTES")
+  info "${C_BOLD}Image Summary:${C_RESET}"
+  info "  Shared / unchanged images      : ${#SHARED_REFS[@]}"
+  info "  Target images already local    : ${ALREADY_LOCAL_COUNT} of ${#NEW_IMAGE_REFS[@]}"
+  if [ "${#TO_PULL_REFS[@]}" -eq 0 ]; then
+    info "  Images to pull from registry   : 0 (all target images are already cached locally)"
+  elif [ "$UNSIZED_PULL_COUNT" -gt 0 ] && [ "$SIZED_PULL_COUNT" -gt 0 ]; then
+    info "  Images to pull from registry   : ${#TO_PULL_REFS[@]} (~${TOTAL_PULL_HUMAN} compressed across ${SIZED_PULL_COUNT} sized + ${UNSIZED_PULL_COUNT} unknown)"
+  elif [ "$SIZED_PULL_COUNT" -gt 0 ]; then
+    info "  Images to pull from registry   : ${#TO_PULL_REFS[@]} (~${TOTAL_PULL_HUMAN} compressed total download)"
+  else
+    info "  Images to pull from registry   : ${#TO_PULL_REFS[@]} (registry manifest sizes unavailable)"
+  fi
+  echo ""
+
+  # Ask before pulling images
+  DO_PULL=false
+  if [ "${#TO_PULL_REFS[@]}" -eq 0 ]; then
+    ok "No image downloads needed."
+  elif [ "$PULL_PREF" = "yes" ]; then
+    DO_PULL=true
+  elif [ "$PULL_PREF" = "no" ]; then
+    info "Skipped image pull (--skip-pull)."
+  else
+    PULL_PROMPT="Pull ${#TO_PULL_REFS[@]} image(s)"
+    [ "$SIZED_PULL_COUNT" -gt 0 ] && PULL_PROMPT="${PULL_PROMPT} (~${TOTAL_PULL_HUMAN})"
+    PULL_PROMPT="${PULL_PROMPT} for ${CHECKOUT_REF} now?"
+    if ask_yes_no "$PULL_PROMPT" "y"; then
+      DO_PULL=true
+    else
+      warn "Skipped pulling images."
+    fi
+  fi
+
+  if [ "$DO_PULL" = true ]; then
+    info "Pulling container images for ${CHECKOUT_REF}..."
+    run_compose pull
+  elif [ "${#TO_PULL_REFS[@]}" -gt 0 ]; then
+    # Prevent 'docker compose up -d' from implicitly pulling uncached images unless user wants it
+    if ! ask_yes_no "Some target images are not local. Recreate containers anyway (missing images will pull)?" "n"; then
+      SKIP_RESTART=true
+      warn "Skipped container recreation so uncached images are not pulled."
+    fi
+  fi
+fi
+
+if [ "$SKIP_RESTART" = false ]; then
   info "Recreating updated containers..."
   run_compose up -d --remove-orphans
 
