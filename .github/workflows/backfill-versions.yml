@@ -59,6 +59,7 @@ jobs:
               --exclude='.env' \
               --exclude='.env.nodewave.example' \
               --exclude='docker-compose.nodewave.yml' \
+              --exclude='docker-compose.caddy.nodewave.yml' \
               --exclude='nodewave' \
               --exclude='README.md' \
               /tmp/supabase-upstream/docker/ ./
