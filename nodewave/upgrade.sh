@@ -27,11 +27,12 @@ STATE_FILE="${SUPABASE_ROOT}/.nodewave-upgrade-state"
 
 TARGET_VERSION=""
 CHANNEL_PREF="" # release | tag | auto
-COMPOSE_FILES_ARG=""
+COMPOSE_FILES_ARG="${NODEWAVE_COMPOSE_FILE:-}"
 IMAGE_CLEANUP_MODE="" # all | select | skip | dangling
 SKIP_BACKUP=false
 SKIP_ENV_SYNC=false
 SKIP_PULL=false
+SKIP_RESTART=false
 AUTO_COMMIT="" # yes | no | prompt
 AUTO_PUSH=""   # yes | no | prompt
 COMMIT_MSG=""
@@ -58,6 +59,7 @@ Options:
       --skip-backup             Skip pre-upgrade database and .env backup
       --skip-env-sync           Skip checking for new keys in .env.example
       --skip-pull               Skip 'docker compose pull'
+      --skip-restart            Update git checkout & .env files only without starting containers
       --commit                  Automatically commit submodule update in parent repo
       --no-commit               Do not commit submodule update in parent repo
       --commit-msg <message>    Custom commit message for parent repository
@@ -146,6 +148,10 @@ while [ $# -gt 0 ]; do
     ;;
   --skip-pull)
     SKIP_PULL=true
+    shift
+    ;;
+  --skip-restart)
+    SKIP_RESTART=true
     shift
     ;;
   --commit)
@@ -261,10 +267,36 @@ ensure_local_excludes() {
   git_dir=$(git -C "$SUPABASE_ROOT" rev-parse --git-dir)
   [[ "$git_dir" = /* ]] || git_dir="${SUPABASE_ROOT}/${git_dir}"
   mkdir -p "${git_dir}/info"
-  for pattern in ".nodewave-upgrade-state" "docker-compose.instance.yml" ".env.clients" ".env.clients.*" ".env.development" ".env.production" "backups/"; do
+  for pattern in \
+    ".nodewave-upgrade-state" \
+    "docker-compose.instance.yml" \
+    ".env" \
+    ".env.clients" \
+    ".env.clients.*" \
+    ".env.development" \
+    ".env.production" \
+    ".env.staging" \
+    ".env.local" \
+    "backups/"; do
     if ! grep -qxF "$pattern" "${git_dir}/info/exclude" 2>/dev/null; then
       echo "$pattern" >>"${git_dir}/info/exclude"
     fi
+  done
+}
+
+# Discover all real (non-symlink, non-template, non-backup) .env* files in SUPABASE_ROOT
+discover_supabase_env_files() {
+  local f base
+  for f in "${SUPABASE_ROOT}/.env" "${SUPABASE_ROOT}"/.env.*; do
+    [ -f "$f" ] || continue
+    [ -L "$f" ] && continue
+    base=$(basename "$f")
+    case "$base" in
+    .env.example | .env.nodewave.example | .env.old | .env.clients | .env.clients.* | *.bak | *.backup.* | *.tmp.* | *.upgrade-tmp)
+      continue
+      ;;
+    esac
+    printf '%s\n' "$f"
   done
 }
 
@@ -283,15 +315,26 @@ resolve_compose_context() {
   local chosen_files="$COMPOSE_FILES_ARG"
 
   if [ -z "$chosen_files" ] && [ "$IS_SUBMODULE" = true ]; then
-    # Discover compose files in parent repo (docker-compose.yml first when managed as symlink)
+    # Discover compose files in parent repo (active symlinks/canonical names first)
     local candidates=()
-    for f in docker-compose.yml docker-compose.prod.yml docker-compose.dev.yml compose.yml compose.prod.yml compose.dev.yml; do
+    for f in \
+      docker-compose.yml \
+      docker-compose.yaml \
+      compose.yml \
+      compose.yaml \
+      docker-compose.prod.yml \
+      docker-compose.dev.yml \
+      docker-compose.staging.yml \
+      docker-compose.local.yml \
+      compose.prod.yml \
+      compose.dev.yml; do
       [ -f "${PARENT_ROOT}/${f}" ] && candidates+=("$f")
     done
 
-    # Infer default: prefer active docker-compose.yml symlink, otherwise match .env symlink
+    # Infer default: prefer active docker-compose.yml/compose.yml symlink, otherwise match .env symlink
     local default_idx=1
-    if [ -L "${PARENT_ROOT}/docker-compose.yml" ] && [ -e "${PARENT_ROOT}/docker-compose.yml" ]; then
+    if { [ -L "${PARENT_ROOT}/docker-compose.yml" ] && [ -e "${PARENT_ROOT}/docker-compose.yml" ]; } ||
+      { [ -L "${PARENT_ROOT}/compose.yml" ] && [ -e "${PARENT_ROOT}/compose.yml" ]; }; then
       default_idx=1
     elif [ -L "${SUPABASE_ROOT}/.env" ]; then
       local link_target
@@ -300,6 +343,10 @@ resolve_compose_context() {
         if [[ "$link_target" == *prod* ]] && [[ "${candidates[$i]}" == *prod* ]]; then
           default_idx=$((i + 1))
         elif [[ "$link_target" == *dev* ]] && [[ "${candidates[$i]}" == *dev* ]]; then
+          default_idx=$((i + 1))
+        elif [[ "$link_target" == *stag* ]] && [[ "${candidates[$i]}" == *stag* ]]; then
+          default_idx=$((i + 1))
+        elif [[ "$link_target" == *local* ]] && [[ "${candidates[$i]}" == *local* ]]; then
           default_idx=$((i + 1))
         fi
       done
@@ -344,42 +391,21 @@ run_compose() {
   (cd "$COMPOSE_WORKDIR" && docker compose "${COMPOSE_FLAGS[@]}" "$@")
 }
 
-ensure_parent_env_and_networks() {
-  if [ "$IS_SUBMODULE" = true ] && [ -f "${PARENT_ROOT}/run.sh" ]; then
-    if ! run_compose config --quiet >/dev/null 2>&1; then
-      if grep -q 'switch_env' "${PARENT_ROOT}/run.sh" 2>/dev/null; then
-        local env_flag="--dev"
-        local active_compose=""
-        [ -L "${PARENT_ROOT}/docker-compose.yml" ] && active_compose=$(readlink "${PARENT_ROOT}/docker-compose.yml")
-        for flag in "${COMPOSE_FLAGS[@]}"; do
-          [[ "$flag" == *prod* ]] && env_flag="--prod"
-        done
-        [[ "$active_compose" == *prod* ]] && env_flag="--prod"
-
-        warn "Parent repository environment symlinks are incomplete."
-        if ask_yes_no "Run '${PARENT_ROOT}/run.sh env ${env_flag}' to initialize parent .env symlinks now?" "y"; then
-          (cd "$PARENT_ROOT" && sh ./run.sh env "$env_flag")
-        fi
-      fi
+ensure_external_networks() {
+  docker info >/dev/null 2>&1 || return 0
+  local ext_nets
+  ext_nets=$(run_compose config 2>/dev/null | awk '
+    /^networks:/ { in_net=1; next }
+    in_net && /^[^[:space:]]/ { in_net=0 }
+    in_net && /^  [a-zA-Z0-9_.-]+:/ { net=$1; sub(/:$/, "", net) }
+    in_net && /external: true/ && net != "" { print net; net="" }
+  ' || true)
+  for net in $ext_nets; do
+    if ! docker network inspect "$net" >/dev/null 2>&1; then
+      docker network create "$net" >/dev/null
+      ok "Created external Docker network: ${net}"
     fi
-  fi
-
-  # Ensure any external Docker networks declared in the resolved compose config exist
-  if docker info >/dev/null 2>&1; then
-    local ext_nets
-    ext_nets=$(run_compose config 2>/dev/null | awk '
-      /^networks:/ { in_net=1; next }
-      in_net && /^[^[:space:]]/ { in_net=0 }
-      in_net && /^  [a-zA-Z0-9_.-]+:/ { net=$1; sub(/:$/, "", net) }
-      in_net && /external: true/ && net != "" { print net; net="" }
-    ' || true)
-    for net in $ext_nets; do
-      if ! docker network inspect "$net" >/dev/null 2>&1; then
-        docker network create "$net" >/dev/null
-        ok "Created external Docker network: ${net}"
-      fi
-    done
-  fi
+  done
 }
 
 # --- Rollback Handler -------------------------------------------------------
@@ -409,10 +435,9 @@ perform_rollback() {
   fi
 
   if [ -n "${ENV_BACKUP_DIR:-}" ] && [ -d "$ENV_BACKUP_DIR" ]; then
-    for f in .env .env.development .env.production; do
-      if [ -f "${ENV_BACKUP_DIR}/${f}" ]; then
-        cp -a "${ENV_BACKUP_DIR}/${f}" "${SUPABASE_ROOT}/${f}"
-      fi
+    for f in "${ENV_BACKUP_DIR}"/.env*; do
+      [ -f "$f" ] || continue
+      cp -a "$f" "${SUPABASE_ROOT}/$(basename "$f")"
     done
     ok "Restored .env files from ${ENV_BACKUP_DIR}"
   fi
@@ -421,10 +446,16 @@ perform_rollback() {
     git -C "$PARENT_ROOT" config -f .gitmodules "submodule.${SUBMODULE_REL}.branch" "$PREV_SUBMODULE_BRANCH"
   fi
 
-  resolve_compose_context
-  ensure_parent_env_and_networks
-  info "Restarting stack with previous version images..."
-  run_compose up -d --remove-orphans
+  if [ "$SKIP_RESTART" = false ]; then
+    resolve_compose_context
+    if run_compose config --quiet >/dev/null 2>&1; then
+      ensure_external_networks
+      info "Restarting stack with previous version images..."
+      run_compose up -d --remove-orphans
+    else
+      warn "Compose stack is not configured on this host; skipped container restart."
+    fi
+  fi
 
   if [ -n "${DB_BACKUP_FILE:-}" ] && [ -f "$DB_BACKUP_FILE" ]; then
     echo ""
@@ -541,7 +572,6 @@ elif [ "$TARGET_VERSION" = "main" ]; then
   CHECKOUT_KIND="branch"
   TRACK_BRANCH_FOR_SUBMODULE="main"
 else
-  # Tag like v0.8.5: check if matching release/v0.8.5 branch also exists
   HAS_RELEASE_BRANCH=false
   if git -C "$SUPABASE_ROOT" show-ref --verify --quiet "refs/remotes/origin/release/${TARGET_VERSION}"; then
     HAS_RELEASE_BRANCH=true
@@ -620,12 +650,14 @@ fi
 
 # --- Resolve Compose Stack & Snapshot Current Docker Images -----------------
 
-resolve_compose_context
+if [ "$SKIP_RESTART" = false ]; then
+  resolve_compose_context
+fi
 
 step "Snapshotting Active Docker Images Before Upgrade"
 
 OLD_IMAGE_PAIRS=() # "repo:tag|sha256:..."
-if docker info >/dev/null 2>&1; then
+if [ "$SKIP_RESTART" = false ] && docker info >/dev/null 2>&1; then
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
     pair=$(docker inspect --format '{{.Config.Image}}|{{.Image}}' "$cid" 2>/dev/null || true)
@@ -676,16 +708,18 @@ if [ "$SKIP_BACKUP" = false ]; then
   step "Pre-Upgrade Backup"
   if ask_yes_no "Create database & .env backup before upgrading?" "y"; then
     mkdir -p "$ENV_BACKUP_DIR"
-    for f in .env .env.development .env.production; do
-      if [ -f "${SUPABASE_ROOT}/${f}" ] && [ ! -L "${SUPABASE_ROOT}/${f}" ]; then
-        cp -a "${SUPABASE_ROOT}/${f}" "${ENV_BACKUP_DIR}/${f}"
-      fi
-    done
+    while IFS= read -r env_f; do
+      [ -n "$env_f" ] && cp -a "$env_f" "${ENV_BACKUP_DIR}/$(basename "$env_f")"
+    done < <(discover_supabase_env_files)
     ok "Environment files backed up to ${ENV_BACKUP_DIR}"
 
     if docker ps --filter "status=running" --format '{{.Names}}\t{{.Image}}' | grep -Eq 'supabase-db|-db(-1)?$|supabase/postgres'; then
-      DB_BACKUP_FILE=$("${SUPABASE_ROOT}/nodewave/backup.sh" --quiet)
-      ok "Database backup saved to ${DB_BACKUP_FILE}"
+      DB_BACKUP_FILE=$("${SUPABASE_ROOT}/nodewave/backup.sh" --quiet 2>/dev/null || true)
+      if [ -n "$DB_BACKUP_FILE" ]; then
+        ok "Database backup saved to ${DB_BACKUP_FILE}"
+      else
+        warn "Database backup returned no file path; verify backups/ directory."
+      fi
     else
       warn "No running Postgres container detected; skipped database dump."
     fi
@@ -734,7 +768,7 @@ else
 fi
 
 # Guard against accidental PG 15 -> PG 17 mismatch on existing data volume
-if [ -f "${SUPABASE_ROOT}/volumes/db/data/PG_VERSION" ]; then
+if [ "$SKIP_RESTART" = false ] && [ -f "${SUPABASE_ROOT}/volumes/db/data/PG_VERSION" ]; then
   DATA_PG_VER=$(tr -d '[:space:]' <"${SUPABASE_ROOT}/volumes/db/data/PG_VERSION")
   NEW_DB_IMG=$(run_compose config 2>/dev/null | awk '/image:.*supabase\/postgres:/{print $2; exit}' || true)
   if [ "$DATA_PG_VER" = "15" ] && [[ "$NEW_DB_IMG" == *":17."* ]]; then
@@ -750,39 +784,37 @@ fi
 # --- .env Key Diff & Migration Helper ---------------------------------------
 
 if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
-  step "Auditing Environment Variables Against .env.example"
+  step "Auditing Environment Variables Against Templates"
 
-  ENV_TARGETS=()
-  for candidate in .env .env.development .env.production; do
-    if [ -f "${SUPABASE_ROOT}/${candidate}" ] && [ ! -L "${SUPABASE_ROOT}/${candidate}" ]; then
-      ENV_TARGETS+=("${SUPABASE_ROOT}/${candidate}")
-    fi
-  done
+  TEMPLATE_FILES=("${SUPABASE_ROOT}/.env.example")
+  [ -f "${SUPABASE_ROOT}/.env.nodewave.example" ] && TEMPLATE_FILES+=("${SUPABASE_ROOT}/.env.nodewave.example")
 
-  for env_file in "${ENV_TARGETS[@]}"; do
+  while IFS= read -r env_file; do
+    [ -n "$env_file" ] || continue
+
     MISSING_KEYS=$(awk -F= '
       /^[A-Z0-9_]+=/ {
-        if (NR == FNR) { seen[$1] = 1 }
-        else if (!($1 in seen)) { print $1 }
+        if (ARGIND == 1) { seen[$1] = 1 }
+        else if (!($1 in seen)) { print $1; seen[$1] = 1 }
       }
-    ' "$env_file" "${SUPABASE_ROOT}/.env.example")
+    ' "$env_file" "${TEMPLATE_FILES[@]}")
 
     if [ -z "$MISSING_KEYS" ]; then
-      ok "$(basename "$env_file"): all keys from .env.example are present."
+      ok "$(basename "$env_file"): all template keys are present."
       continue
     fi
 
     MISSING_COUNT=$(printf '%s\n' "$MISSING_KEYS" | wc -l | tr -d ' ')
-    warn "$(basename "$env_file") is missing ${MISSING_COUNT} key(s) from .env.example:"
+    warn "$(basename "$env_file") is missing ${MISSING_COUNT} key(s) from template(s):"
     printf '%s\n' "$MISSING_KEYS" | sed 's/^/      - /'
 
-    if ask_yes_no "Append missing default variables from .env.example to $(basename "$env_file")?" "y"; then
+    if ask_yes_no "Append missing default variables to $(basename "$env_file")?" "y"; then
       {
         echo ""
         echo "# Added by nodewave/upgrade.sh on ${STAMP} (${CHECKOUT_REF})"
         while IFS= read -r mkey; do
           [ -n "$mkey" ] || continue
-          grep -m1 "^${mkey}=" "${SUPABASE_ROOT}/.env.example" || true
+          grep -h -m1 "^${mkey}=" "${TEMPLATE_FILES[@]}" 2>/dev/null | head -n1 || true
         done <<<"$MISSING_KEYS"
       } >>"$env_file"
       ok "Appended missing keys to $(basename "$env_file")."
@@ -793,21 +825,35 @@ if [ "$SKIP_ENV_SYNC" = false ] && [ -f "${SUPABASE_ROOT}/.env.example" ]; then
       if ask_yes_no "Generate asymmetric ES256 & opaque API keys for $(basename "$env_file") now?" "y"; then
         (
           cd "$SUPABASE_ROOT"
-          if [ "$(basename "$env_file")" != ".env" ]; then
-            cp "$env_file" .env.upgrade-tmp
-            sh ./utils/add-new-auth-keys.sh --update-env >/dev/null
-            git checkout -- docker-compose.yml 2>/dev/null || true
-            rm -f .env.old docker-compose.yml.old .env.upgrade-tmp
-          else
-            sh ./utils/add-new-auth-keys.sh --update-env >/dev/null
-            git checkout -- docker-compose.yml 2>/dev/null || true
-            rm -f .env.old docker-compose.yml.old
+          local_link=""
+          local_real=""
+          if [ -L .env ]; then
+            local_link=$(readlink .env)
+            local_real=$(cd "$(dirname .env)" && realpath .env 2>/dev/null || readlink -f .env 2>/dev/null || true)
           fi
+          if [ "$(basename "$env_file")" != ".env" ] && [ "$env_file" != "$local_real" ]; then
+            cp -a "$env_file" .env.upgrade-tmp
+            [ -L .env ] && rm -f .env
+            cp -a "$env_file" .env
+            sh ./utils/add-new-auth-keys.sh --update-env >/dev/null
+            mv .env "$env_file"
+            [ -n "$local_link" ] && ln -sfn "$local_link" .env
+            rm -f .env.upgrade-tmp
+          else
+            [ -L .env ] && rm -f .env && cp -a "$env_file" .env
+            sh ./utils/add-new-auth-keys.sh --update-env >/dev/null
+            if [ -n "$local_link" ]; then
+              mv .env "$env_file"
+              ln -sfn "$local_link" .env
+            fi
+          fi
+          git checkout -- docker-compose.yml 2>/dev/null || true
+          rm -f .env.old docker-compose.yml.old
         )
         ok "Generated asymmetric auth keys."
       fi
     fi
-  done
+  done < <(discover_supabase_env_files)
 
   # Refresh .env.clients if manage.sh is available
   if [ -x "${SUPABASE_ROOT}/nodewave/manage.sh" ] && [ -f "${SUPABASE_ROOT}/.env" ]; then
@@ -826,40 +872,78 @@ fi
 
 # --- Validate Compose, Pull Images & Restart Stack --------------------------
 
-step "Validating Compose Configuration & Updating Containers"
+if [ "$SKIP_RESTART" = false ]; then
+  step "Validating Compose Configuration & Updating Containers"
 
-ensure_parent_env_and_networks
+  while true; do
+    if COMPOSE_ERR=$(run_compose config --quiet 2>&1); then
+      ok "Compose configuration validated."
+      break
+    fi
 
-if ! COMPOSE_ERR=$(run_compose config --quiet 2>&1); then
-  printf '%s\n' "$COMPOSE_ERR" >&2
-  die "Docker Compose configuration validation failed. Fix the missing .env file or compose reference above and re-run."
+    echo ""
+    warn "Docker Compose configuration validation failed:"
+    printf '%s\n' "$COMPOSE_ERR" | sed 's/^/      /'
+    echo ""
+
+    if [ "$NON_INTERACTIVE" = true ] || [ ! -t 0 ]; then
+      die "Docker Compose validation failed in non-interactive mode (pass --skip-restart to update git submodule only)."
+    fi
+
+    info "Choose how to proceed:"
+    printf '    [r] Retry validation (after fixing/initializing missing .env files)\n'
+    printf '    [s] Skip container pull/restart and continue with git submodule update\n'
+    printf '    [b] Roll back checkout to %s and exit\n' "${PREV_BRANCH:-${PREV_TAG:-$PREV_SHORT}}"
+    printf '    [a] Abort without rolling back\n'
+    printf '    Choice [r/s/b/a]: '
+    read -r val_choice
+    case "$val_choice" in
+    [Rr]) continue ;;
+    [Ss])
+      SKIP_RESTART=true
+      warn "Skipped container pull/restart."
+      break
+      ;;
+    [Bb])
+      perform_rollback
+      exit 1
+      ;;
+    *)
+      die "Aborted due to Docker Compose validation error."
+      ;;
+    esac
+  done
 fi
-ok "Compose configuration validated."
 
-if [ "$SKIP_PULL" = false ]; then
-  info "Pulling container images for ${CHECKOUT_REF}..."
-  run_compose pull
-fi
+if [ "$SKIP_RESTART" = false ]; then
+  ensure_external_networks
 
-info "Recreating updated containers..."
-run_compose up -d --remove-orphans
-
-sleep 3
-UNHEALTHY=$(run_compose ps --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -E 'Exit|Restarting|unhealthy' || true)
-if [ -n "$UNHEALTHY" ]; then
-  warn "Some containers reported issues after restart:"
-  printf '%s\n' "$UNHEALTHY" | sed 's/^/      /'
-  if ask_yes_no "Roll back to ${PREV_BRANCH:-${PREV_TAG:-$PREV_SHORT}} now?" "y"; then
-    perform_rollback
-    exit 1
+  if [ "$SKIP_PULL" = false ]; then
+    info "Pulling container images for ${CHECKOUT_REF}..."
+    run_compose pull
   fi
-else
-  ok "All stack services started cleanly."
+
+  info "Recreating updated containers..."
+  run_compose up -d --remove-orphans
+
+  sleep 3
+  UNHEALTHY=$(run_compose ps --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -E 'Exit|Restarting|unhealthy' || true)
+  if [ -n "$UNHEALTHY" ]; then
+    warn "Some containers reported issues after restart:"
+    printf '%s\n' "$UNHEALTHY" | sed 's/^/      /'
+    if ask_yes_no "Roll back to ${PREV_BRANCH:-${PREV_TAG:-$PREV_SHORT}} now?" "y"; then
+      perform_rollback
+      exit 1
+    fi
+  else
+    ok "All stack services started cleanly."
+  fi
 fi
 
 # --- Interactive Previous-Version Docker Image Removal ----------------------
 
 cleanup_previous_images() {
+  [ "$SKIP_RESTART" = true ] && return 0
   [ "$IMAGE_CLEANUP_MODE" = "skip" ] && {
     info "Skipped previous-version Docker image cleanup."
     return 0
