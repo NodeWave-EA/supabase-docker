@@ -1,0 +1,91 @@
+name: Sync Upstream Supabase Docker
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Specific self-hosted/v* tag to sync (leave empty for latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Nodewave repository
+        uses: actions/checkout@v4
+
+      - name: Resolve target upstream tag
+        id: resolve
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TARGET_TAG="${{ github.event.inputs.tag }}"
+          else
+            TARGET_TAG=$(git ls-remote --tags --refs --sort=-v:refname \
+              https://github.com/supabase/supabase.git 'refs/tags/self-hosted/v*' \
+              | head -n1 | sed 's|.*refs/tags/||')
+          fi
+
+          if [ -z "$TARGET_TAG" ]; then
+            echo "Could not resolve an upstream self-hosted/v* tag." >&2
+            exit 1
+          fi
+
+          CURRENT_TAG=$(cat .upstream-version 2>/dev/null || echo "none")
+          echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "current_tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGET_TAG" = "$CURRENT_TAG" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sparse-clone upstream docker directory
+        if: steps.resolve.outputs.up_to_date == 'false'
+        run: |
+          TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "$TARGET_TAG" \
+            https://github.com/supabase/supabase.git /tmp/supabase-upstream
+          git -C /tmp/supabase-upstream sparse-checkout set docker
+
+      - name: Sync upstream files to repository root
+        if: steps.resolve.outputs.up_to_date == 'false'
+        run: |
+          TARGET_TAG="${{ steps.resolve.outputs.target_tag }}"
+          rsync -av --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.upstream-version' \
+            --exclude='.env' \
+            --exclude='.env.nodewave.example' \
+            --exclude='docker-compose.nodewave.yml' \
+            --exclude='nodewave' \
+            --exclude='README.md' \
+            /tmp/supabase-upstream/docker/ ./
+
+          printf "%s\n" "$TARGET_TAG" > .upstream-version
+
+      - name: Create Pull Request
+        if: steps.resolve.outputs.up_to_date == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(upstream): sync supabase docker ${{ steps.resolve.outputs.target_tag }}"
+          branch: "sync/supabase-${{ steps.resolve.outputs.target_tag }}"
+          delete-branch: true
+          title: "chore(upstream): update Supabase Docker to ${{ steps.resolve.outputs.target_tag }}"
+          body: |
+            Automated sync of `supabase/supabase/docker` from `${{ steps.resolve.outputs.current_tag }}` to **`${{ steps.resolve.outputs.target_tag }}`**.
+
+            ### Review Checklist
+            - [ ] Review changes in `CHANGELOG.md` and `docker-compose.yml` for breaking environment variables or Postgres major upgrades.
+            - [ ] Verify `.env.nodewave.example` includes any newly required keys from `.env.example`.
+            - [ ] Run `nodewave/backup.sh` on target servers before pulling and recreating containers.

@@ -1,0 +1,35 @@
+x-nodewave-logging: &nodewave-logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "25m"
+      max-file: "5"
+
+services:
+  caddy:
+    <<: *nodewave-logging
+    restart: unless-stopped
+
+  api-gw:
+    <<: *nodewave-logging
+
+  studio:
+    <<: *nodewave-logging
+
+  auth:
+    <<: *nodewave-logging
+
+  rest:
+    <<: *nodewave-logging
+
+  realtime:
+    <<: *nodewave-logging
+
+  storage:
+    <<: *nodewave-logging
+
+  db:
+    <<: *nodewave-logging
+
+  functions:
+    <<: *nodewave-logging
