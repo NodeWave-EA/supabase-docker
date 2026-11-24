@@ -1,0 +1,77 @@
+name: Backfill Historical Supabase Versions
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Number of recent self-hosted/v* releases to import (oldest to newest)"
+        required: true
+        default: "5"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Nodewave repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Backfill upstream tags in chronological order
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COUNT: ${{ github.event.inputs.count }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Fetch the last N tags sorted newest-first, then reverse to oldest-first
+          TAGS=$(git ls-remote --tags --refs --sort=-v:refname \
+            https://github.com/supabase/supabase.git 'refs/tags/self-hosted/v*' \
+            | head -n "$COUNT" \
+            | sed 's|.*refs/tags/||' \
+            | tac)
+
+          for UPSTREAM_TAG in $TAGS; do
+            VERSION="${UPSTREAM_TAG#self-hosted/}"
+            RELEASE_BRANCH="release/${VERSION}"
+
+            if git rev-parse "$VERSION" >/dev/null 2>&1; then
+              echo "Skipping ${VERSION} (already exists)"
+              continue
+            fi
+
+            echo "Importing ${UPSTREAM_TAG} as ${VERSION}..."
+            rm -rf /tmp/supabase-upstream
+            git clone --depth 1 --filter=blob:none --sparse \
+              --branch "$UPSTREAM_TAG" \
+              https://github.com/supabase/supabase.git /tmp/supabase-upstream
+            git -C /tmp/supabase-upstream sparse-checkout set docker
+
+            rsync -av --delete \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='.upstream-version' \
+              --exclude='.env' \
+              --exclude='.env.nodewave.example' \
+              --exclude='docker-compose.nodewave.yml' \
+              --exclude='nodewave' \
+              --exclude='README.md' \
+              /tmp/supabase-upstream/docker/ ./
+
+            printf "%s\n" "$UPSTREAM_TAG" > .upstream-version
+
+            git add -A
+            git commit -m "chore(upstream): sync supabase docker ${UPSTREAM_TAG}"
+            git tag -a "$VERSION" -m "Nodewave Supabase Docker ${VERSION} (upstream ${UPSTREAM_TAG})"
+            git branch -f "$RELEASE_BRANCH" HEAD
+
+            git push origin main "$VERSION" "$RELEASE_BRANCH"
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --notes "Backfilled from upstream [\`${UPSTREAM_TAG}\`](https://github.com/supabase/supabase/releases/tag/${UPSTREAM_TAG})."
+          done

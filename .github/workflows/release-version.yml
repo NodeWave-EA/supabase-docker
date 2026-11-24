@@ -1,0 +1,50 @@
+name: Tag and Branch Version on Merge
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".upstream-version"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create version tag, release branch, and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(tr -d '[:space:]' < .upstream-version)
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "none" ]; then
+            echo "No valid upstream version found in .upstream-version."
+            exit 0
+          fi
+
+          # Convert "self-hosted/v0.8.4" -> "v0.8.4"
+          VERSION="${UPSTREAM_TAG#self-hosted/}"
+          RELEASE_BRANCH="release/${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Create/update the release branch at this commit
+          git branch -f "$RELEASE_BRANCH" HEAD
+          git push -f origin "$RELEASE_BRANCH"
+
+          # Create immutable tag & GitHub Release if not already published
+          if ! git rev-parse "$VERSION" >/dev/null 2>&1; then
+            git tag -a "$VERSION" -m "Nodewave Supabase Docker ${VERSION} (upstream ${UPSTREAM_TAG})"
+            git push origin "$VERSION"
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --notes "Synced from upstream [\`${UPSTREAM_TAG}\`](https://github.com/supabase/supabase/releases/tag/${UPSTREAM_TAG}) with Nodewave Caddy & logging overlay."
+          fi
