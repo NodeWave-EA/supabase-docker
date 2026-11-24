@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".nodewave-overlays"
+      - ".github/workflows/sync-overlay.yml"
       - "nodewave/**"
       - "*nodewave*"
       - "**/*nodewave*"
@@ -75,40 +76,49 @@ jobs:
           fetch-depth: 0
 
       - name: Sync Nodewave overlay paths from main manifest
-        id: sync
         run: |
           set -euo pipefail
+          git fetch origin main
 
-          MANIFEST=$(git show origin/main:.nodewave-overlays \
-            | grep -Ev '^[[:space:]]*(#|$)' \
-            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          python3 - <<'PY'
+          import fnmatch
+          import os
+          import subprocess
 
-          while IFS= read -r pattern; do
-            [ -n "$pattern" ] || continue
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True)
 
-            if [[ "$pattern" == */ ]]; then
-              dir="${pattern%/}"
-              rm -rf "$dir"
-              if git cat-file -e "origin/main:${dir}" 2>/dev/null; then
-                git checkout origin/main -- "$dir"
-              fi
-            elif [[ "$pattern" == *'*'* || "$pattern" == *'?'* || "$pattern" == *'['* ]]; then
-              while IFS= read -r existing; do
-                [ -n "$existing" ] && rm -f "$existing"
-              done < <(git ls-files "$pattern")
+          manifest_raw = git("show", "origin/main:.nodewave-overlays")
+          patterns = [
+              line.strip()
+              for line in manifest_raw.splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          ]
 
-              while IFS= read -r matched; do
-                [ -n "$matched" ] && git checkout origin/main -- "$matched"
-              done < <(git ls-tree -r --name-only origin/main -- "$pattern")
-            else
-              rm -f "$pattern"
-              if git cat-file -e "origin/main:${pattern}" 2>/dev/null; then
-                git checkout origin/main -- "$pattern"
-              fi
-            fi
-          done <<< "$MANIFEST"
+          def matches(path: str) -> bool:
+              for pat in patterns:
+                  if pat.endswith("/"):
+                      if path.startswith(pat):
+                          return True
+                  elif fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(os.path.basename(path), pat):
+                      return True
+              return False
 
-          git reset HEAD
+          # 1. Remove currently tracked overlay files so deletions on main propagate cleanly
+          tracked = [f for f in git("ls-files").splitlines() if f]
+          for f in tracked:
+              if matches(f) and os.path.exists(f):
+                  os.remove(f)
+
+          # 2. Check out all matching overlay files from origin/main in a single pass
+          main_files = [f for f in git("ls-tree", "-r", "--name-only", "origin/main").splitlines() if f]
+          to_checkout = sorted({f for f in main_files if matches(f)})
+
+          print("Syncing overlay files:", ", ".join(to_checkout))
+          if to_checkout:
+              subprocess.run(["git", "checkout", "origin/main", "--", *to_checkout], check=True)
+              subprocess.run(["git", "reset", "HEAD", "--", *to_checkout], check=True)
+          PY
 
       - name: Open or update Pull Request
         uses: peter-evans/create-pull-request@v7
