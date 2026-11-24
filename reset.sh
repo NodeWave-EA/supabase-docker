@@ -55,9 +55,6 @@ for dir in $BIND_MOUNTS; do
     fi
 done
 
-mkdir -p ./volumes/storage
-touch ./volumes/storage/.gitkeep
-
 echo "===> Resetting .env file (will save backup to .env.old)..."
 confirm
 if [ -f ".env" ] || [ -L ".env" ]; then

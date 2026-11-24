@@ -11,9 +11,6 @@ server {
     server_name ${PROXY_DOMAIN};
     server_tokens off;
 
-    client_max_body_size 0;
-    proxy_request_buffering off;
-
     proxy_http_version 1.1;
 
     proxy_set_header Host $host;
@@ -86,9 +83,6 @@ server {
 
     location /functions {
         proxy_pass http://api_gw_upstream;
-
-        # Outlast the runtime's 150s request idle timeout, matching the API gateway.
-        proxy_read_timeout 160s;
     }
 
     location /mcp {
@@ -96,10 +90,6 @@ server {
     }
 
     location /sso {
-        proxy_pass http://api_gw_upstream;
-    }
-
-    location = /.well-known/oauth-authorization-server/auth/v1 {
         proxy_pass http://api_gw_upstream;
     }
 }

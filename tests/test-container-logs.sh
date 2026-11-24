@@ -127,23 +127,21 @@ check_logs rest \
 
 check_logs realtime \
     'Starting Realtime' \
-    'Tenant set-up successfully' \
+    'Connected to Postgres database' \
     'Janitor started' \
     'Starting MetricsCleaner'
 
 check_logs storage \
     'Started Successfully'
 
-# Next.js builds print "Ready in <n>s"; TanStack Start builds print "Listening on: <url>"
 check_logs studio \
-    'ready in.*s$|Listening on:'
+    'ready in.*s$'
 
 check_logs meta \
     'Server listening at http'
 
 check_logs functions \
-    'main function started' \
-    'Memory pressure monitor active'
+    'main function started'
 
 check_logs_if_running analytics \
     'Access LogflareWeb.Endpoint at http://localhost:4000' \

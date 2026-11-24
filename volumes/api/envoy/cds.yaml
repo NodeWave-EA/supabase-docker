@@ -17,7 +17,6 @@ resources:
                   socket_address:
                     address: auth
                     port_value: 9999
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -50,7 +49,6 @@ resources:
                   socket_address:
                     address: rest
                     port_value: 3000
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -83,7 +81,6 @@ resources:
                   socket_address:
                     address: realtime-dev.supabase-realtime
                     port_value: 4000
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -116,7 +113,6 @@ resources:
                   socket_address:
                     address: storage
                     port_value: 5000
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -149,7 +145,6 @@ resources:
                   socket_address:
                     address: functions
                     port_value: 9000
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -181,7 +176,6 @@ resources:
                   socket_address:
                     address: meta
                     port_value: 8080
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s
@@ -214,7 +208,6 @@ resources:
                   socket_address:
                     address: studio
                     port_value: 3000
-    ignore_health_on_host_removal: true
     health_checks:
       - timeout: 2s
         interval: 5s

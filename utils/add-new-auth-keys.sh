@@ -38,17 +38,17 @@ else
         exit 1
     fi
 
-    if ! ${DOCKER:-docker} info >/dev/null; then
-        echo "Error: cannot connect to the Docker daemon."
+    if ! docker info >/dev/null 2>&1; then
+        echo "Error: docker is installed but the daemon is not running."
         exit 1
     fi
 
-    if ! ${DOCKER:-docker} image inspect node:22-alpine >/dev/null 2>&1; then
+    if ! docker image inspect node:22-alpine >/dev/null 2>&1; then
         echo "Pulling node:22-alpine (first-run only)..."
-        ${DOCKER:-docker} pull node:22-alpine
+        docker pull node:22-alpine
     fi
 
-    node_runner="${DOCKER:-docker} run --rm node:22-alpine node"
+    node_runner="docker run --rm node:22-alpine node"
 fi
 
 # Read JWT_SECRET from .env
