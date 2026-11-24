@@ -6,10 +6,6 @@ x-nodewave-logging: &nodewave-logging
       max-file: "5"
 
 services:
-  caddy:
-    <<: *nodewave-logging
-    restart: unless-stopped
-
   api-gw:
     <<: *nodewave-logging
 
@@ -18,18 +14,26 @@ services:
 
   auth:
     <<: *nodewave-logging
+    environment:
+      GOTRUE_JWT_KEYS: ${JWT_KEYS:-[]}
 
   rest:
     <<: *nodewave-logging
 
   realtime:
     <<: *nodewave-logging
+    environment:
+      API_JWT_JWKS: ${JWT_JWKS:-{"keys":[]}}
 
   storage:
     <<: *nodewave-logging
+    environment:
+      JWT_JWKS: ${JWT_JWKS:-{"keys":[]}}
 
   db:
     <<: *nodewave-logging
 
   functions:
     <<: *nodewave-logging
+    environment:
+      SUPABASE_JWKS: ${JWT_JWKS:-{"keys":[]}}
