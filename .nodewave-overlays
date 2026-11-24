@@ -1,0 +1,13 @@
+# Central manifest of Nodewave overlay files, directories & globs (Single Source of Truth)
+# Consumed by:
+#   - .github/workflows/sync-overlay.yml      (propagated from main to all release/v* branches via PR)
+#   - .github/workflows/sync-upstream.yml     (protected from rsync --delete during upstream syncs)
+#   - .github/workflows/backfill-versions.yml (protected from rsync --delete during backfills)
+
+.nodewave-overlays
+.env.nodewave.example
+docker-compose.nodewave.yml
+docker-compose.caddy.nodewave.yml
+*.nodewave.*
+nodewave/
+README.md
